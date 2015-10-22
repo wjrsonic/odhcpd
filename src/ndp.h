@@ -22,10 +22,18 @@
 
 #define NDP_MAX_NEIGHBORS 1000
 
+enum {
+	NEIGH_STATE_REACHABLE,
+	NEIGH_STATE_STALE,
+	NEIGH_STATE_INCOMPLETE
+};
+
 struct ndp_neighbor {
 	struct list_head head;
 	struct interface *iface;
+	int state;
 	struct in6_addr addr;
-	uint8_t len;
-	time_t timeout;
+	uint8_t lladdr[16];
+	//uint8_t len;
+	//time_t timeout;
 };

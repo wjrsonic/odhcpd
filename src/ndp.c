@@ -39,6 +39,8 @@ static void handle_solicit(void *addr, void *data, size_t len,
 static void handle_rtnetlink(void *addr, void *data, size_t len,
 		struct interface *iface, void *dest);
 
+static struct list_head neighbors = LIST_HEAD_INIT(neighbors);
+static size_t neighbor_count = 0;
 static uint32_t rtnl_seqid = 0;
 static int ping_socket = -1;
 static struct odhcpd_event rtnl_event = {{.fd = -1}, handle_rtnetlink};
@@ -247,7 +249,7 @@ static void handle_solicit(void *addr, void *data, size_t len,
 
 	char ipbuf[INET6_ADDRSTRLEN];
 	inet_ntop(AF_INET6, &req->nd_ns_target, ipbuf, sizeof(ipbuf));
-	syslog(LOG_DEBUG, "Got a NS for %s", ipbuf);
+	syslog(LOG_DEBUG, "Got a NS for %s from %s", ipbuf, iface->ifname);
 
 	uint8_t mac[6];
 	odhcpd_get_mac(iface, mac);
@@ -325,6 +327,56 @@ static void check_updates(struct interface *iface)
 		raise(SIGUSR1);
 }
 
+static struct ndp_neighbor* find_neighbor(const struct in6_addr *addr)
+{
+	//time_t now = time(NULL);
+	struct ndp_neighbor *n, *e;
+	list_for_each_entry_safe(n, e, &neighbors, head) {
+		if (IN6_ARE_ADDR_EQUAL(&n->addr, addr))
+			return n;
+		/*if (!n->iface && abs(n->timeout - now) >= 5)
+			free_neighbor(n);*/
+	}
+	return NULL;
+}
+
+static void free_neighbor(struct ndp_neighbor *n)
+{
+	setup_route(&n->addr, n->iface, false);
+	list_del(&n->head);
+	free(n);
+	neighbor_count--;
+}
+
+static void add_neighbor(struct interface *iface, struct in6_addr *addr, const uint8_t *lladdr)
+{
+	struct ndp_neighbor *i, *tmp, *n = find_neighbor(addr);
+
+	if (!n) {
+		n = malloc(sizeof(*n));
+		memcpy(&n->addr, addr, sizeof(n->addr));
+		list_add(&n->head, &neighbors);
+		neighbor_count++;
+	}
+	n->state = NEIGH_STATE_REACHABLE;
+	n->iface = iface;
+	memcpy(n->lladdr, lladdr, sizeof(n->lladdr));
+
+	list_for_each_entry_safe(i, tmp, &neighbors, head) {
+		if (i->state == NEIGH_STATE_STALE) {
+			if (memcmp(i->lladdr, lladdr, sizeof(i->lladdr)) == 0) {
+				//syslog(LOG_DEBUG, "free_neighbor()");
+				free_neighbor(i);
+			}
+			else {
+				i->state = NEIGH_STATE_INCOMPLETE;
+				ping6(addr, iface);
+			}
+		}
+	}
+	syslog(LOG_DEBUG, "neighbor_count=%d", neighbor_count);
+	setup_route(addr, iface, true);
+}
 
 // Handler for neighbor cache entries from the kernel. This is our source
 // to learn and unlearn hosts on interfaces.
@@ -333,6 +385,7 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 {
 	bool dump_neigh = false;
 	struct in6_addr last_solicited = IN6ADDR_ANY_INIT;
+	char namebuf[INET6_ADDRSTRLEN];
 
 	for (struct nlmsghdr *nh = data; NLMSG_OK(nh, len);
 			nh = NLMSG_NEXT(nh, len)) {
@@ -363,12 +416,16 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 		uint16_t atype = (is_addr) ? IFA_ADDRESS : NDA_DST;
 		ssize_t alen = NLMSG_PAYLOAD(nh, rta_offset);
 		struct in6_addr *addr = NULL;
+		const uint8_t *lladdr = NULL;
 
 		for (struct rtattr *rta = (void*)(((uint8_t*)ndm) + rta_offset);
 				RTA_OK(rta, alen); rta = RTA_NEXT(rta, alen)) {
 			if (rta->rta_type == atype &&
 					RTA_PAYLOAD(rta) >= sizeof(*addr)) {
 				addr = RTA_DATA(rta);
+			}
+			else if (rta->rta_type == NDA_LLADDR) {
+				lladdr = RTA_DATA(rta);
 			}
 		}
 
@@ -413,6 +470,7 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 					send(rtnl_event.uloop.fd, &req, sizeof(req), MSG_DONTWAIT);
 					setup_route(addr, iface, false);
 					dump_neigh = true;
+					syslog(LOG_DEBUG, "Dump & flush proxy entries.");
 				}
 			} else if (add) {
 				struct interface *c;
@@ -434,8 +492,16 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 						send(rtnl_event.uloop.fd, &req, sizeof(req), MSG_DONTWAIT);
 					}
 				}
+				if (nh->nlmsg_type == RTM_NEWNEIGH &&
+					ndm->ndm_state & NUD_REACHABLE) {
+					inet_ntop(AF_INET6, addr, namebuf, sizeof(namebuf));
+					syslog(LOG_DEBUG, "NUD_REACHABLE iface=%s addr=%s lladdr=%02x:%02x:%02x:%02x:%02x:%02x",
+						iface->ifname, namebuf,
+						lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
+					add_neighbor(iface, addr, lladdr);
+				}
 
-				setup_route(addr, iface, true);
+				//setup_route(addr, iface, true);
 			} else {
 				if (nh->nlmsg_type == RTM_NEWNEIGH) {
 					// might be locally originating
@@ -456,7 +522,17 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 							send(rtnl_event.uloop.fd, &req, sizeof(req), MSG_DONTWAIT);
 						}
 					}
-					setup_route(addr, iface, false);
+
+					struct ndp_neighbor *n = find_neighbor(addr);
+					//inet_ntop(AF_INET6, addr, namebuf, sizeof(namebuf));
+					if (n) {
+						if (n->state == NEIGH_STATE_INCOMPLETE) {
+							free_neighbor(n);
+						} else {
+							n->state = NEIGH_STATE_STALE;
+						}
+					}
+					//setup_route(addr, iface, false);
 
 					// also: dump to add proxies back in case it moved elsewhere
 					dump_neigh = true;
@@ -491,3 +567,4 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 	if (dump_neigh)
 		dump_neigh_table(false);
 }
+
