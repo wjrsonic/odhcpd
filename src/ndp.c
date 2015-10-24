@@ -348,29 +348,51 @@ static void free_neighbor(struct ndp_neighbor *n)
 	neighbor_count--;
 }
 
-static void add_neighbor(struct interface *iface, struct in6_addr *addr, const uint8_t *lladdr)
+static void add_neighbor(struct interface *iface, struct in6_addr *addr,
+	const uint8_t *lladdr, unsigned int lladdr_len)
 {
 	struct ndp_neighbor *i, *tmp, *n = find_neighbor(addr);
+	char namebuf[INET6_ADDRSTRLEN];
 
 	if (!n) {
 		n = malloc(sizeof(*n));
 		memcpy(&n->addr, addr, sizeof(n->addr));
+		n->iface = iface;
+		n->lladdr_len = (lladdr_len < sizeof(n->lladdr)) ? lladdr_len : sizeof(n->lladdr);
+		memcpy(n->lladdr, lladdr, n->lladdr_len);
+		inet_ntop(AF_INET6, &n->addr, namebuf, sizeof(namebuf));
+		syslog(LOG_DEBUG, "add_neighbor(%s)",namebuf);
 		list_add(&n->head, &neighbors);
 		neighbor_count++;
 	}
 	n->state = NEIGH_STATE_REACHABLE;
-	n->iface = iface;
-	memcpy(n->lladdr, lladdr, sizeof(n->lladdr));
+	
 
 	list_for_each_entry_safe(i, tmp, &neighbors, head) {
 		if (i->state == NEIGH_STATE_STALE) {
-			if (memcmp(i->lladdr, lladdr, sizeof(i->lladdr)) == 0) {
-				//syslog(LOG_DEBUG, "free_neighbor()");
+			inet_ntop(AF_INET6, &i->addr, namebuf, sizeof(namebuf));
+
+			// 链路层地址相同则说明来自同一主机
+			if (lladdr_len == i->lladdr_len &&
+				memcmp(i->lladdr, lladdr, n->lladdr_len) == 0) {
+				syslog(LOG_DEBUG, "free_neighbor(%s)", namebuf);
 				free_neighbor(i);
 			}
-			else {
+			/*else {
 				i->state = NEIGH_STATE_INCOMPLETE;
-				ping6(addr, iface);
+				syslog(LOG_DEBUG, "ping %s", namebuf);
+				ping6(&i->addr, i->iface);
+			}*/
+		}
+	}
+	if (neighbor_count >= NEIGH_GC_THRESHOLD) {
+		// 执行垃圾回收
+		list_for_each_entry(i, &neighbors, head) {
+			if (i->state == NEIGH_STATE_STALE) {
+				inet_ntop(AF_INET6, &i->addr, namebuf, sizeof(namebuf));
+				i->state = NEIGH_STATE_INCOMPLETE;
+				syslog(LOG_DEBUG, "ping %s", namebuf);
+				ping6(&i->addr, i->iface);
 			}
 		}
 	}
@@ -417,6 +439,7 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 		ssize_t alen = NLMSG_PAYLOAD(nh, rta_offset);
 		struct in6_addr *addr = NULL;
 		const uint8_t *lladdr = NULL;
+		unsigned int lladdr_len = 0;
 
 		for (struct rtattr *rta = (void*)(((uint8_t*)ndm) + rta_offset);
 				RTA_OK(rta, alen); rta = RTA_NEXT(rta, alen)) {
@@ -426,6 +449,7 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 			}
 			else if (rta->rta_type == NDA_LLADDR) {
 				lladdr = RTA_DATA(rta);
+				lladdr_len = RTA_PAYLOAD(rta);
 			}
 		}
 
@@ -492,13 +516,9 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 						send(rtnl_event.uloop.fd, &req, sizeof(req), MSG_DONTWAIT);
 					}
 				}
-				if (nh->nlmsg_type == RTM_NEWNEIGH &&
-					ndm->ndm_state & NUD_REACHABLE) {
-					inet_ntop(AF_INET6, addr, namebuf, sizeof(namebuf));
-					syslog(LOG_DEBUG, "NUD_REACHABLE iface=%s addr=%s lladdr=%02x:%02x:%02x:%02x:%02x:%02x",
-						iface->ifname, namebuf,
-						lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
-					add_neighbor(iface, addr, lladdr);
+				if (nh->nlmsg_type == RTM_NEWNEIGH && ndm->ndm_state & NUD_REACHABLE &&
+					!iface->master) {
+					add_neighbor(iface, addr, lladdr, lladdr_len);
 				}
 
 				//setup_route(addr, iface, true);
@@ -527,11 +547,14 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 					//inet_ntop(AF_INET6, addr, namebuf, sizeof(namebuf));
 					if (n) {
 						if (n->state == NEIGH_STATE_INCOMPLETE) {
+							inet_ntop(AF_INET6, &n->addr, namebuf, sizeof(namebuf));
+							syslog(LOG_DEBUG, "free_neighbor(%s)", namebuf);
 							free_neighbor(n);
 						} else {
 							n->state = NEIGH_STATE_STALE;
 						}
 					}
+					
 					//setup_route(addr, iface, false);
 
 					// also: dump to add proxies back in case it moved elsewhere

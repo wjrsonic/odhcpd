@@ -20,7 +20,8 @@
 #define SOL_NETLINK 270
 #endif
 
-#define NDP_MAX_NEIGHBORS 1000
+#define NDP_MAX_NEIGHBORS 1000	// 暂时不用
+#define NEIGH_GC_THRESHOLD 16	// 邻居条目达到这个值就执行垃圾回收
 
 enum {
 	NEIGH_STATE_REACHABLE,
@@ -34,6 +35,7 @@ struct ndp_neighbor {
 	int state;
 	struct in6_addr addr;
 	uint8_t lladdr[16];
+	unsigned int lladdr_len;
 	//uint8_t len;
 	//time_t timeout;
 };
