@@ -375,26 +375,22 @@ static void add_neighbor(struct interface *iface, struct in6_addr *addr,
 
 	list_for_each_entry_safe(i, tmp, &neighbors, head) {
 		if (i->state == NEIGH_STATE_STALE) {
-			inet_ntop(AF_INET6, &i->addr, namebuf, sizeof(namebuf));
-
 			// 链路层地址相同则说明来自同一主机
 			if (n->lladdr_len == i->lladdr_len &&
-				memcmp(i->lladdr, n->lladdr, n->lladdr_len) == 0) {
-				free_neighbor(i);
-			}
-			/*else {
+					memcmp(i->lladdr, n->lladdr, n->lladdr_len) == 0) {
 				i->state = NEIGH_STATE_INCOMPLETE;
-				syslog(LOG_WARNING, "ping %s", namebuf);
+				inet_ntop(AF_INET6, &i->addr, namebuf, sizeof(namebuf));
+				syslog(LOG_NOTICE, "ping %s", namebuf);
 				ping6(&i->addr, i->iface);
-			}*/
+			}
 		}
 	}
 	if (neighbor_count >= NEIGH_GC_THRESHOLD) {
-		//执行垃圾回收
+		// 执行垃圾回收
 		list_for_each_entry(i, &neighbors, head) {
 			if (i->state == NEIGH_STATE_STALE) {
-				inet_ntop(AF_INET6, &i->addr, namebuf, sizeof(namebuf));
 				i->state = NEIGH_STATE_INCOMPLETE;
+				inet_ntop(AF_INET6, &i->addr, namebuf, sizeof(namebuf));
 				syslog(LOG_NOTICE, "ping %s", namebuf);
 				ping6(&i->addr, i->iface);
 			}
